@@ -1,0 +1,235 @@
+import discord
+from discord.ext import commands
+import os
+import asyncio
+import zipfile
+import plistlib
+import subprocess
+import tempfile
+import ssl
+import OpenSSL.crypto
+from base64 import b64encode
+
+bot = commands.Bot(command_prefix='!', intents=discord.Intents.all())
+
+# Configuration
+CONFIG = {
+    "temp_folder": "temp_ipa_files",
+    "max_file_size": 50 * 1024 * 1024,  # 50MB
+    "allowed_roles": ["iOS Developer"],
+    "keychain_password": "your_keychain_password"  # For unlocking keychain
+}
+
+# In-memory storage for uploaded files
+user_files = {}
+
+@bot.event
+async def on_ready():
+    print(f'Bot connected as {bot.user.name}')
+
+@bot.command(name='uploadp12', help='Upload your enterprise .p12 certificate')
+async def upload_p12(ctx):
+    if not any(role.name in CONFIG["allowed_roles"] for role in ctx.author.roles):
+        await ctx.send("🚫 Permission denied")
+        return
+
+    if not ctx.message.attachments:
+        await ctx.send("ℹ️ Please attach a .p12 file")
+        return
+
+    attachment = ctx.message.attachments[0]
+    if not attachment.filename.lower().endswith('.p12'):
+        await ctx.send("🚫 File must be .p12 format")
+        return
+
+    user_files[ctx.author.id] = {"p12": await attachment.read()}
+    await ctx.send("✅ P12 certificate stored. Now please upload your .mobileprovision file using `!uploadprovision`")
+
+@bot.command(name='uploadprovision', help='Upload your mobile provisioning profile')
+async def upload_provision(ctx):
+    if ctx.author.id not in user_files or "p12" not in user_files[ctx.author.id]:
+        await ctx.send("🚫 Please upload your .p12 file first using `!uploadp12`")
+        return
+
+    if not ctx.message.attachments:
+        await ctx.send("ℹ️ Please attach a .mobileprovision file")
+        return
+
+    attachment = ctx.message.attachments[0]
+    if not attachment.filename.lower().endswith('.mobileprovision'):
+        await ctx.send("🚫 File must be .mobileprovision format")
+        return
+
+    user_files[ctx.author.id]["provision"] = await attachment.read()
+    await ctx.send("✅ Provisioning profile stored. Now upload your .ipa file using `!signipa`")
+
+@bot.command(name='signipa', help='Sign an IPA file with your credentials')
+async def sign_ipa(ctx):
+    if ctx.author.id not in user_files or "provision" not in user_files[ctx.author.id]:
+        await ctx.send("🚫 Please upload both .p12 and .mobileprovision files first")
+        return
+
+    if not ctx.message.attachments:
+        await ctx.send("ℹ️ Please attach an .ipa file")
+        return
+
+    attachment = ctx.message.attachments[0]
+    if not attachment.filename.lower().endswith('.ipa'):
+        await ctx.send("🚫 File must be .ipa format")
+        return
+
+    if attachment.size > CONFIG["max_file_size"]:
+        await ctx.send(f"🚫 File too large. Max size: {CONFIG['max_file_size']/1024/1024}MB")
+        return
+
+    await ctx.send("🔏 Starting signing process...")
+
+    try:
+        # Create temp directory
+        os.makedirs(CONFIG["temp_folder"], exist_ok=True)
+        temp_dir = tempfile.mkdtemp(dir=CONFIG["temp_folder"])
+
+        # Save uploaded files
+        ipa_path = os.path.join(temp_dir, attachment.filename)
+        await attachment.save(ipa_path)
+
+        p12_path = os.path.join(temp_dir, "cert.p12")
+        with open(p12_path, "wb") as f:
+            f.write(user_files[ctx.author.id]["p12"])
+
+        prov_path = os.path.join(temp_dir, "embedded.mobileprovision")
+        with open(prov_path, "wb") as f:
+            f.write(user_files[ctx.author.id]["provision"])
+
+        # Install certificate
+        await install_p12_certificate(p12_path)
+
+        # Extract entitlements
+        entitlements = extract_entitlements(prov_path)
+
+        # Sign the IPA
+        signed_path = await sign_ipa_file(ipa_path, prov_path, entitlements, temp_dir)
+
+        # Send the signed file
+        await ctx.send("✅ IPA signed successfully!", file=discord.File(signed_path))
+
+    except Exception as e:
+        await ctx.send(f"❌ Error during signing: {str(e)}")
+    finally:
+        # Clean up
+        if os.path.exists(temp_dir):
+            for root, dirs, files in os.walk(temp_dir, topdown=False):
+                for name in files:
+                    os.remove(os.path.join(root, name))
+                for name in dirs:
+                    os.rmdir(os.path.join(root, name))
+            os.rmdir(temp_dir)
+
+async def install_p12_certificate(p12_path):
+    try:
+        # Import certificate to keychain
+        result = subprocess.run([
+            'security', 'import', p12_path,
+            '-P', '',  # Empty password for this example (should prompt or use real password)
+            '-T', '/usr/bin/codesign',
+            '-T', '/usr/bin/productsign',
+            '-k', '/Library/Keychains/System.keychain'
+        ], capture_output=True, text=True)
+
+        if result.returncode != 0:
+            raise Exception(f"Failed to import P12: {result.stderr}")
+
+        # Find certificate identity
+        result = subprocess.run([
+            'security', 'find-identity', '-v', '-p', 'codesigning'
+        ], capture_output=True, text=True)
+
+        if result.returncode != 0:
+            raise Exception(f"Failed to find identities: {result.stderr}")
+
+        # Parse identity from output
+        lines = result.stdout.split('\n')
+        for line in lines:
+            if '"iPhone Distribution"' in line or '"Apple Distribution"' in line:
+                return line.split('"')[1]
+
+        raise Exception("No valid distribution certificate found")
+
+    except Exception as e:
+        raise Exception(f"Certificate installation failed: {str(e)}")
+
+def extract_entitlements(provision_path):
+    with open(provision_path, 'rb') as f:
+        provision_data = f.read()
+
+    # Find the plist section
+    start = provision_data.find(b'<?xml')
+    end = provision_data.find(b'</plist>') + 8
+    plist_data = provision_data[start:end]
+    plist = plistlib.loads(plist_data)
+
+    return plist.get('Entitlements', {})
+
+async def sign_ipa_file(ipa_path, provision_path, entitlements, temp_dir):
+    # Extract IPA
+    with zipfile.ZipFile(ipa_path, 'r') as zip_ref:
+        zip_ref.extractall(temp_dir)
+
+    # Find .app bundle
+    app_bundle = None
+    payload_dir = os.path.join(temp_dir, 'Payload')
+    for item in os.listdir(payload_dir):
+        if item.endswith('.app'):
+            app_bundle = os.path.join(payload_dir, item)
+            break
+
+    if not app_bundle:
+        raise Exception("No .app bundle found in IPA")
+
+    # Copy provisioning profile
+    embedded_profile = os.path.join(app_bundle, 'embedded.mobileprovision')
+    os.replace(provision_path, embedded_profile)
+
+    # Create entitlements file
+    entitlements_path = os.path.join(temp_dir, 'entitlements.plist')
+    with open(entitlements_path, 'wb') as f:
+        plistlib.dump(entitlements, f)
+
+    # Sign frameworks first
+    frameworks_dir = os.path.join(app_bundle, 'Frameworks')
+    if os.path.exists(frameworks_dir):
+        for framework in os.listdir(frameworks_dir):
+            if framework.endswith('.framework'):
+                framework_path = os.path.join(frameworks_dir, framework)
+                subprocess.run([
+                    'codesign', '--force', '--sign', 'iPhone Distribution',
+                    '--entitlements', entitlements_path,
+                    framework_path
+                ], check=True)
+
+    # Sign the app bundle
+    subprocess.run([
+        'codesign', '--force', '--sign', 'iPhone Distribution',
+        '--entitlements', entitlements_path,
+        app_bundle
+    ], check=True)
+
+    # Repackage as IPA
+    signed_path = ipa_path.replace('.ipa', '_signed.ipa')
+    subprocess.run([
+        'zip', '-qr', signed_path, 'Payload'
+    ], cwd=temp_dir, check=True)
+
+    return signed_path
+
+@bot.command(name='clean', help='Clear your stored files')
+async def clean_files(ctx):
+    if ctx.author.id in user_files:
+        del user_files[ctx.author.id]
+        await ctx.send("✅ Your stored files have been cleared")
+    else:
+        await ctx.send("ℹ️ No files to clear")
+
+# Run the bot
+bot.run('MTM3OTYwNzM5OTI4Mjc3MDAyMA.GptqC8.jtE_8XVMKBsVf38KB61LDqsu4P1os9v78D8rJI')
+
